@@ -1,0 +1,35 @@
+# Settings for dao_rake_round.py.  Every key is optional; the values shown
+# are the defaults, which reproduce prog03_dao_roundmethod8.sas as written.
+#
+#   python dao_rake_round.py input.parquet --out-dir run1 --config config.toml
+
+value_col = "blend_pop"
+detail_keys = ["nation", "state", "county", "age", "sex", "race31", "hisp", "gqt"]
+state_gqt_keys = ["nation", "state", "gqt"]             # stage 1 rake and rounding groups
+county_gqt_keys = ["nation", "state", "county", "gqt"]  # stage 2 rake and rounding groups
+age_col = "age"
+gqt_col = "gqt"
+
+# Coarsening: round positive values to the nearest rounding_base; a positive
+# value that would round to 0 becomes min_positive.
+# NOTE: a comment in the SAS program says D5 moved to multiples of 10, but
+# the SAS code rounds to 5.  This default follows the code.
+rounding_base = 5.0
+min_positive = 1.0
+
+# Seed for the random tiebreaker used when integerizing (SAS: streaminit(42)).
+seed = 42
+
+# false: stop if the value column has missing values.
+# true:  carry them through the way SAS does.
+allow_missing_values = false
+
+# Age universe by GQ type.  A row is out of universe, and cannot receive an
+# added person, when age <= out_at_or_below or age >= out_at_or_above.
+# GQ types not listed (0, 4, 7) have no restriction.
+[age_universe]
+1 = { out_at_or_below = 14 }                        # eligible 15+
+2 = { out_at_or_above = 26 }                        # eligible 0-25
+3 = { out_at_or_below = 19 }                        # eligible 20+
+5 = { out_at_or_below = 15, out_at_or_above = 66 }  # eligible 16-65
+6 = { out_at_or_below = 16, out_at_or_above = 65 }  # eligible 17-64 (military)

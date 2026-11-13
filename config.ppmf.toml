@@ -1,0 +1,7 @@
+# Config for running dao_rake_round.py on cells built by ppmf_to_input.py.
+#
+# The only change from the defaults is the race column: the PPMF carries
+# CENRACE's 63 categories, not the 31-category race31.  Race is a detail key
+# only; no rake or rounding group uses it.
+
+detail_keys = ["nation", "state", "county", "age", "sex", "cenrace", "hisp", "gqt"]
