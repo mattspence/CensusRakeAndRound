@@ -180,3 +180,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .DS_Store
+run*
+sas/master/
+*.parquet
+*.csv
+*.sas7bdat
