@@ -1,0 +1,126 @@
+=== A. The chain ===
+state_gqt -> county_gqt -> tract_gqt -> block_gqt -> householder -> detail
+┌─────────────┬────────┬────────┬──────────────┬──────────────────┬───────────┐
+│ level       ┆ rows   ┆ differ ┆ max_abs_diff ┆ positive_to_zero ┆ shortfall │
+╞═════════════╪════════╪════════╪══════════════╪══════════════════╪═══════════╡
+│ county_gqt  ┆ 33     ┆ 23     ┆ 3.000        ┆ 0                ┆ 0         │
+│ tract_gqt   ┆ 355    ┆ 269    ┆ 3.000        ┆ 0                ┆ 0         │
+│ block_gqt   ┆ 16427  ┆ 12929  ┆ 11.000       ┆ 0                ┆ 0         │
+│ householder ┆ 32518  ┆ 23382  ┆ 6.000        ┆ 329              ┆ 0         │
+│ detail      ┆ 967828 ┆ 119220 ┆ 4.000        ┆ 10856            ┆ 0         │
+└─────────────┴────────┴────────┴──────────────┴──────────────────┴───────────┘
+state x GQT groups off target: 0 of 16
+
+=== B. One block traced through the chain: state 91, county 003, tract 000700 ===
+tract x GQT (raked to county x GQT, integerized):
+┌────────┬─────┬──────────┬───────────┬──────────┬──────────┐
+│ tract  ┆ gqt ┆ original ┆ coarsened ┆ raked    ┆ control  │
+╞════════╪═════╪══════════╪═══════════╪══════════╪══════════╡
+│ 000700 ┆ 0   ┆ 3641.000 ┆ 3640.000  ┆ 3639.901 ┆ 3640.000 │
+└────────┴─────┴──────────┴───────────┴──────────┴──────────┘
+its 60 household blocks: original total 3641, coarsened total 3636, rake factor 1.00110, control total 3640
+┌───────┬──────────┬───────────┬─────────┬─────────┐
+│ block ┆ original ┆ coarsened ┆ raked   ┆ control │
+╞═══════╪══════════╪═══════════╪═════════╪═════════╡
+│ 4005  ┆ 2.000    ┆ 1.000     ┆ 1.001   ┆ 1.000   │
+│ 3014  ┆ 3.000    ┆ 5.000     ┆ 5.006   ┆ 5.000   │
+│ 2010  ┆ 4.000    ┆ 5.000     ┆ 5.006   ┆ 5.000   │
+│ 1010  ┆ 5.000    ┆ 5.000     ┆ 5.006   ┆ 5.000   │
+│ 4003  ┆ 38.000   ┆ 40.000    ┆ 40.044  ┆ 40.000  │
+│ 1012  ┆ 39.000   ┆ 40.000    ┆ 40.044  ┆ 40.000  │
+│ 3006  ┆ 323.000  ┆ 325.000   ┆ 325.358 ┆ 326.000 │
+│ 3012  ┆ 367.000  ┆ 365.000   ┆ 365.402 ┆ 366.000 │
+└───────┴──────────┴───────────┴─────────┴─────────┘
+
+block 1001: original 23 persons, coarsened 25, raked 25.028, control 25
+householder split (raked to the block control, integerized):
+┌─────────────┬──────────┬───────────┬────────┬─────────┐
+│ householder ┆ original ┆ coarsened ┆ raked  ┆ control │
+╞═════════════╪══════════╪═══════════╪════════╪═════════╡
+│ 0           ┆ 13.000   ┆ 15.000    ┆ 15.000 ┆ 15.000  │
+│ 1           ┆ 10.000   ┆ 10.000    ┆ 10.000 ┆ 10.000  │
+└─────────────┴──────────┴───────────┴────────┴─────────┘
+its 22 populated cells:
+┌─────────────┬─────┬─────┬─────────┬──────┬─────────┬───────┬───────────┬───────┬───────┐
+│ householder ┆ age ┆ sex ┆ cenrace ┆ hisp ┆ relship ┆ input ┆ coarsened ┆ raked ┆ final │
+╞═════════════╪═════╪═════╪═════════╪══════╪═════════╪═══════╪═══════════╪═══════╪═══════╡
+│ 0           ┆ 5   ┆ 1   ┆ 2       ┆ 1    ┆ 30      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 5   ┆ 2   ┆ 1       ┆ 1    ┆ 25      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 9   ┆ 2   ┆ 45      ┆ 1    ┆ 25      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 2     │
+│ 0           ┆ 11  ┆ 1   ┆ 4       ┆ 1    ┆ 25      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 2     │
+│ 0           ┆ 18  ┆ 1   ┆ 1       ┆ 1    ┆ 21      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 20  ┆ 1   ┆ 2       ┆ 1    ┆ 34      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 23  ┆ 1   ┆ 1       ┆ 1    ┆ 32      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 27  ┆ 2   ┆ 13      ┆ 1    ┆ 21      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 2     │
+│ 0           ┆ 39  ┆ 1   ┆ 7       ┆ 1    ┆ 25      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 48  ┆ 1   ┆ 14      ┆ 1    ┆ 21      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 48  ┆ 2   ┆ 1       ┆ 1    ┆ 21      ┆ 2.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 0           ┆ 49  ┆ 1   ┆ 2       ┆ 1    ┆ 33      ┆ 1.000 ┆ 1.000     ┆ 1.250 ┆ 1     │
+│ 1           ┆ 52  ┆ 2   ┆ 6       ┆ 2    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 54  ┆ 2   ┆ 1       ┆ 1    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 56  ┆ 2   ┆ 8       ┆ 1    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 57  ┆ 1   ┆ 4       ┆ 1    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 57  ┆ 2   ┆ 10      ┆ 2    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 58  ┆ 2   ┆ 13      ┆ 1    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 62  ┆ 2   ┆ 1       ┆ 1    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 68  ┆ 2   ┆ 6       ┆ 2    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 69  ┆ 2   ┆ 1       ┆ 2    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+│ 1           ┆ 84  ┆ 1   ┆ 1       ┆ 1    ┆ 20      ┆ 1.000 ┆ 1.000     ┆ 1.000 ┆ 1     │
+└─────────────┴─────┴─────┴─────────┴──────┴─────────┴───────┴───────────┴───────┴───────┘
+
+=== C. What happens to a cell, by its input count ===
+┌───────┬────────┬────────────┬─────────────┬───────────────┬─────────────┬──────────┬─────────┐
+│ input ┆ cells  ┆ persons_in ┆ persons_out ┆ pct_unchanged ┆ pct_to_zero ┆ mean_out ┆ max_out │
+╞═══════╪════════╪════════════╪═════════════╪═══════════════╪═════════════╪══════════╪═════════╡
+│ 1     ┆ 888087 ┆ 888087     ┆ 910282      ┆ 95.084        ┆ 1.218       ┆ 1.025    ┆ 3       │
+│ 2     ┆ 58270  ┆ 116540     ┆ 60478       ┆ 3.834         ┆ 0.065       ┆ 1.038    ┆ 3       │
+│ 3     ┆ 12602  ┆ 37806      ┆ 66580       ┆ 0.032         ┆ 0.000       ┆ 5.283    ┆ 6       │
+│ 4     ┆ 4158   ┆ 16632      ┆ 21886       ┆ 6.734         ┆ 0.000       ┆ 5.264    ┆ 6       │
+│ 5-7   ┆ 3219   ┆ 18101      ┆ 16715       ┆ 43.305        ┆ 0.000       ┆ 5.193    ┆ 6       │
+│ 8-12  ┆ 1086   ┆ 10147      ┆ 11223       ┆ 15.562        ┆ 0.000       ┆ 10.334   ┆ 12      │
+│ 13+   ┆ 406    ┆ 8687       ┆ 8836        ┆ 23.153        ┆ 0.000       ┆ 21.764   ┆ 109     │
+└───────┴────────┴────────────┴─────────────┴───────────────┴─────────────┴──────────┴─────────┘
+share of cells holding exactly 1 person: 91.8%
+cells of 1 that are still 1: 95.1%
+
+=== D. Householders ===
+  place_keys: ['nation', 'state', 'county', 'tract', 'block', 'gqt']
+  places_with_household_population: {'original': 16345, 'final': 16345}
+  places_without_a_householder: {'original': 0, 'final': 157}
+  householders: {'original': 423575, 'final': 423966}
+block householder counts: unchanged 5271, changed 11074, max abs change 6
+blocks left with household population but no householder: 157 | their original sizes (persons): {2: 157}
+
+=== E. Relationship and age rules ===
+barred cells: 81 | persons in: 81 | persons out: 64
+┌─────────┬───────┬───────┬─────────┬─────────┬────────┬───────┐
+│ relship ┆ in_gq ┆ cells ┆ age_min ┆ age_max ┆ input  ┆ final │
+╞═════════╪═══════╪═══════╪═════════╪═════════╪════════╪═══════╡
+│ 20      ┆ false ┆ 63    ┆ 0       ┆ 14      ┆ 63.000 ┆ 58    │
+│ 37      ┆ true  ┆ 7     ┆ 0       ┆ 92      ┆ 7.000  ┆ 4     │
+│ 38      ┆ true  ┆ 11    ┆ 4       ┆ 100     ┆ 11.000 ┆ 2     │
+└─────────┴───────┴───────┴─────────┴─────────┴────────┴───────┘
+barred cells that ended above floor(raked): 0
+
+=== F. Would the tract stage have mattered?  Same run without it ===
+with tract stage     household tract totals: mean abs diff 1.17, 95th pct 2, max 3
+without tract stage  household tract totals: mean abs diff 8.45, 95th pct 20, max 28
+
+=== G. Totals not in the chain ===
+county total  groups      5  mean abs diff 1.20  max 3
+tract total   groups    275  mean abs diff 1.36  max 6
+block total   groups  16345  mean abs diff 1.19  max 11
+state x age      groups of 100+ persons:  202  median abs change 0.45%  max 4.9%
+state x sex      groups of 100+ persons:    4  median abs change 0.03%  max 0.1%
+state x cenrace  groups of 100+ persons:   79  median abs change 1.92%  max 4.9%
+state x hisp     groups of 100+ persons:    4  median abs change 0.07%  max 0.2%
+state x relship  groups of 100+ persons:   38  median abs change 0.78%  max 2.6%
+
+=== H. Independent re-check of the written files with DuckDB ===
+  state_gqt_groups: 16   equal_to_input: 16
+  level: county_gqt   controls: 33   met_by_output: 33
+  level: tract_gqt   controls: 355   met_by_output: 355
+  level: block_gqt   controls: 16427   met_by_output: 16427
+  level: householder   controls: 32518   met_by_output: 32518
+  rows_out: 967828   persons_out: 1096000   min_out: 0   max_out: 109
+  cells_in: 967828   missing_from_output: 0

@@ -1,0 +1,58 @@
+# Block-level rake and round, with tract, block and householders per block
+# controlled.  Written for cells built by:
+#
+#   python ppmf_to_input.py <person file> --out cells.parquet --level block
+#   python dao_rake_round.py cells.parquet --out-dir run_blocks --config config.block.toml
+#
+# For your own detail file, change the column names here to match it
+# (for example race31 in place of cenrace).
+
+# One row per populated cell.  The order of these keys is the sort order of
+# the file, which also fixes the order of the random tiebreakers.
+detail_keys = [
+    "nation", "state", "county", "tract", "block",
+    "age", "sex", "cenrace", "hisp", "gqt", "relship",
+]
+
+# The control chain, coarsest first.  The first level's unrounded totals are
+# the starting control.  Each later level is coarsened, raked to the integer
+# controls of the level above, and integerized.  The detail cells are then
+# raked to the last level.
+control_levels = [
+    ["nation", "state", "gqt"],
+    ["nation", "state", "county", "gqt"],
+    ["nation", "state", "county", "tract", "gqt"],
+    ["nation", "state", "county", "tract", "block", "gqt"],
+    ["nation", "state", "county", "tract", "block", "gqt", "householder"],
+]
+
+# Relationship to householder.  `householder` in the last level above is a
+# 0/1 column derived from it (1 = one of householder_codes); it is not
+# written to the output.
+relationship_col = "relship"
+householder_codes = [20]
+
+# Where each relationship can exist.  A cell outside these rules keeps the
+# whole persons it already has but can never receive an added person.
+# Codes are the 2020 Census RELSHIP codes.  These four entries are the
+# built-in defaults, written out so they are easy to change.
+#
+# TO CONFIRM: the minimum age of 15, and any further age rules you want
+# (parents, parents-in-law, children-in-law, foster children).
+
+[[relationship_universe]]   # householder, spouses, unmarried partners
+codes = [20, 21, 22, 23, 24]
+gqt = [0]
+min_age = 15
+
+[[relationship_universe]]   # every other household relationship
+codes = [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
+gqt = [0]
+
+[[relationship_universe]]   # institutional GQ person
+codes = [37]
+gqt = [1, 2, 3, 4]
+
+[[relationship_universe]]   # noninstitutional GQ person
+codes = [38]
+gqt = [5, 6, 7]

@@ -41,6 +41,21 @@ combination in every county x GQ type, like a full master file.  That is
 cells only matter when the age-universe rules push an added person past
 the cells that have people in them.
 
+Block level
+-----------
+--level block also keeps the tract, the block and the relationship:
+
+TABTRACTCE        ->  tract     6-character tract code, kept as text
+TABBLK            ->  block     4-character block number, kept as text
+RELSHIP (20-38)   ->  relship   relationship to householder, as an integer
+
+    python ppmf_to_input.py 2020_ppmf_person.csv --out de_blocks.parquet --level block --states 10
+    python dao_rake_round.py de_blocks.parquet --out-dir run_blocks --config config.block.toml
+
+Only populated cells are written (--fill-zeros is not available: the full
+rectangle at block level is far too large).  Expect close to one row per
+person, so run one state at a time.
+
 Requires duckdb (pip install duckdb).  DuckDB streams the CSV, so the
 national file does not have to fit in memory.
 """
@@ -57,6 +72,10 @@ import duckdb
 REQUIRED = ["TABBLKST", "TABBLKCOU", "RTYPE", "QAGE", "QSEX", "CENRACE", "CENHISP", "GQTYPE_PL"]
 N_RACES = 63
 N_GQT = 8  # 0 = housing unit, 1-7 = major GQ types
+BLOCK_REQUIRED = ["TABTRACTCE", "TABBLK", "RELSHIP"]
+COUNTY_KEYS = ["nation", "state", "county", "age", "sex", "cenrace", "hisp", "gqt"]
+BLOCK_KEYS = ["nation", "state", "county", "tract", "block",
+              "age", "sex", "cenrace", "hisp", "gqt", "relship"]
 
 
 def build_cells(
@@ -65,15 +84,19 @@ def build_cells(
     states: Sequence[str] | None = None,
     max_age: int = 100,
     fill_zeros: bool = False,
+    level: str = "county",
 ) -> None:
     """Create the table `cells` in `con` from the PPMF person CSV."""
+    block_level = level == "block"
+    if block_level and fill_zeros:
+        raise SystemExit("--fill-zeros is not available with --level block.")
     src = str(person_csv).replace("'", "''")
     con.execute(
         "CREATE OR REPLACE VIEW person AS "
         f"SELECT * FROM read_csv('{src}', header = true, all_varchar = true)"
     )
     have = {row[0].upper() for row in con.execute("DESCRIBE person").fetchall()}
-    missing = [c for c in REQUIRED if c not in have]
+    missing = [c for c in REQUIRED + (BLOCK_REQUIRED if block_level else []) if c not in have]
     if missing:
         raise SystemExit(
             f"{person_csv}: expected PPMF person-file columns not found: {missing}.\n"
@@ -85,16 +108,20 @@ def build_cells(
         codes = ", ".join(f"'{int(s):02d}'" for s in states)
         where = f"WHERE TABBLKST IN ({codes})"
 
+    block_columns = "TABTRACTCE AS tract, TABBLK AS block," if block_level else ""
+    relship_column = "CAST(RELSHIP AS INTEGER) AS relship," if block_level else ""
     con.execute(f"""
         CREATE OR REPLACE TABLE counted AS
         SELECT 1                                   AS nation,
                TABBLKST                            AS state,
                TABBLKCOU                           AS county,
+               {block_columns}
                LEAST(CAST(QAGE AS INTEGER), {int(max_age)}) AS age,
                CAST(QSEX AS INTEGER)               AS sex,
                CAST(CENRACE AS INTEGER)            AS cenrace,
                CAST(CENHISP AS INTEGER)            AS hisp,
                CAST(GQTYPE_PL AS INTEGER)          AS gqt,
+               {relship_column}
                CAST(COUNT(*) AS DOUBLE)            AS blend_pop,
                COUNT(*) FILTER ((RTYPE = '3') <> (CAST(GQTYPE_PL AS INTEGER) = 0)) AS rtype_mismatch
         FROM person
@@ -144,8 +171,15 @@ def summarize(con: duckdb.DuckDBPyConnection) -> str:
     by_gqt = con.execute(
         "SELECT gqt, CAST(SUM(blend_pop) AS BIGINT) FROM cells GROUP BY gqt ORDER BY gqt"
     ).fetchall()
+    geography = f"states {n_state}   counties {n_county}"
+    if "block" in {row[0] for row in con.execute("DESCRIBE cells").fetchall()}:
+        n_tract, n_block = con.execute(
+            "SELECT COUNT(DISTINCT (state, county, tract)), "
+            "COUNT(DISTINCT (state, county, tract, block)) FROM cells"
+        ).fetchone()
+        geography += f"   tracts {n_tract:,}   blocks {n_block:,}"
     lines = [
-        f"persons {int(persons):,}   states {n_state}   counties {n_county}",
+        f"persons {int(persons):,}   {geography}",
         f"cells   {rows:,} ({positive:,} with at least one person)",
         "persons by gqt: " + "  ".join(f"{g}: {n:,}" for g, n in by_gqt),
     ]
@@ -164,11 +198,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="top-code age at this value (default 100)")
     p.add_argument("--fill-zeros", action="store_true",
                    help="add zero rows so every county x GQ type has every detail cell")
+    p.add_argument("--level", choices=["county", "block"], default="county",
+                   help="block: also keep tract, block and relationship (default: county)")
     args = p.parse_args(argv)
 
     con = duckdb.connect()
-    build_cells(con, args.person_csv, args.states, args.max_age, args.fill_zeros)
-    order = "ORDER BY nation, state, county, age, sex, cenrace, hisp, gqt"
+    build_cells(con, args.person_csv, args.states, args.max_age, args.fill_zeros, args.level)
+    order = "ORDER BY " + ", ".join(BLOCK_KEYS if args.level == "block" else COUNTY_KEYS)
     fmt = "(FORMAT PARQUET)" if args.out.suffix == ".parquet" else "(FORMAT CSV, HEADER)"
     con.execute(f"COPY (SELECT * FROM cells {order}) TO '{args.out}' {fmt}")
     print(summarize(con))

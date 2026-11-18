@@ -2,6 +2,10 @@
 
 Run with:  pytest test_dao_rake_round.py
 
+Sections 1 to 3 cover the SAS program's two-stage method.  Section 4 covers
+the extension to a longer control chain (tract, block, householders per
+block) and the relationship rules, in the same three ways.
+
 Three kinds of test:
 
 1. Hand-worked examples for each building block.
@@ -115,7 +119,7 @@ def ref_rakeit(udsn, uvar, cgrp, cdsn, cvar, ovar):
     return out
 
 
-def ref_roundit(idsn, ivar, lst, ovar, seed=42):
+def ref_roundit(idsn, ivar, lst, ovar, seed=42, extra_rule=None):
     use_rules = all("age" in r and "gqt" in r for r in idsn)
 
     rounding = []
@@ -140,6 +144,8 @@ def ref_roundit(idsn, ivar, lst, ovar, seed=42):
                 r["age_uni"] = 0
             if gqt == 6 and high >= 65:
                 r["age_uni"] = 0
+        if extra_rule is not None and not extra_rule(r):
+            r["age_uni"] = 0
         r["integer"] = math.floor(r[ivar])
         r["mantissa"] = r[ivar] - r["integer"]
         rounding.append(r)
@@ -285,7 +291,8 @@ def test_coarsen_replaces_the_column_in_with_columns():
 
 
 @pytest.mark.parametrize(
-    "kind", ["integers", "negative", "int8", "uint64", "text", "floats", "wide range", "nulls"]
+    "kind", ["integers", "negative", "int8", "uint64", "text", "floats", "wide range", "nulls",
+             "sparse codes", "two packed integers"]
 )
 def test_sort_by_keys_matches_the_plain_stable_sort(kind):
     rng = np.random.default_rng(0)
@@ -306,7 +313,15 @@ def test_sort_by_keys_matches_the_plain_stable_sort(kind):
         df = df.with_columns(pl.col("a") * 2**40, pl.col("b") * 2**40)
     elif kind == "nulls":
         df = df.with_columns(pl.when(pl.col("b") == 5).then(None).otherwise(pl.col("b")).alias("b"))
+    elif kind == "sparse codes":  # like tract codes: few values over a huge range
+        df = df.with_columns(pl.col("a") * 10**15, pl.col("b") * 10**9 + 7)
     keys = ["a", "b", "c"]
+    if kind == "two packed integers":  # 8 keys of 5,000 values each: about 2**98 combinations
+        wide = {f"k{i}": rng.permutation(n) * (3 + i) for i in range(4)}
+        text = {f"t{i}": [f"{x:05d}" for x in rng.permutation(n)] for i in range(4)}
+        df = df.with_columns(**{name: pl.Series(v) for name, v in (wide | text).items()})
+        df = df.with_columns(pl.col("k0") // 50, pl.col("t0").str.slice(0, 2))  # leading keys tie
+        keys = ["k0", "t0", "a", "k1", "t1", "k2", "t2", "k3", "t3", "b", "c"]
     assert_frame_equal(m.sort_by_keys(df, keys), df.sort(keys, maintain_order=True))
     assert m.sort_by_keys(df, keys).columns == df.columns
     assert_frame_equal(m.sort_by_keys(df.head(0), keys), df.head(0))
@@ -704,3 +719,438 @@ def test_csv_types_are_inferred_from_the_whole_file(tmp_path):
     path = tmp_path / "late_fraction.csv"
     path.write_text("x\n" + "0\n" * 150 + "1.5\n")
     assert m.read_table(path)["x"].dtype == pl.Float64
+
+
+# ==========================================================================
+# 4. Longer control chains, householders and relationship rules
+# ==========================================================================
+
+BLOCK_KEYS = ["nation", "state", "county", "tract", "block",
+              "age", "sex", "race31", "hisp", "gqt", "relship"]
+BLOCK_LEVELS = (
+    ("nation", "state", "gqt"),
+    ("nation", "state", "county", "gqt"),
+    ("nation", "state", "county", "tract", "gqt"),
+    ("nation", "state", "county", "tract", "block", "gqt"),
+    ("nation", "state", "county", "tract", "block", "gqt", "householder"),
+)
+BLOCK_NAMES = ["state_gqt", "county_gqt", "tract_gqt", "block_gqt", "householder"]
+
+
+def block_config(**overrides) -> m.Config:
+    settings = {"detail_keys": tuple(BLOCK_KEYS), "control_levels": BLOCK_LEVELS,
+                "relationship_col": "relship"}
+    return m.Config(**{**settings, **overrides})
+
+
+def make_block_detail(seed=0, n_persons=9000, fractional=False, impossible=False) -> pl.DataFrame:
+    """Populated cells only, as a block-level file has to be.
+
+    Persons are drawn one by one and counted into cells.  Blocks are very
+    uneven in size and GQ residents sit in a few blocks.  With
+    impossible=True a few persons break the relationship rules: householders
+    under 15, a householder in a GQ, a GQ person in a household.
+    """
+    rng = np.random.default_rng(seed)
+    n = n_persons
+    state = rng.integers(1, 3, n)
+    county = rng.choice([1, 3], n)
+    tract = rng.integers(1, 4, n) * 100
+    block = 1000 + rng.choice(15, n, p=rng.dirichlet(np.full(15, 0.5)))
+    gqt = np.where(rng.random(n) < 0.06, rng.integers(1, 8, n), 0)
+    block = np.where(gqt > 0, 2000 + gqt, block)          # one facility block per GQ type
+    # GQ residents are 20 to 25, which is inside every GQ type's age universe.
+    age = np.where(gqt > 0, rng.integers(20, 26, n), rng.integers(0, 90, n))
+    relship = np.where(gqt == 0, 0, np.where(gqt <= 4, 37, 38))
+    household = gqt == 0
+    adult = household & (age >= 18)
+    relship = np.where(adult, rng.choice([20, 20, 21, 22, 25, 33, 34], n), relship)
+    relship = np.where(household & ~adult, rng.choice([25, 27, 30, 35], n), relship)
+    if impossible:
+        children = np.flatnonzero(household & (age < 15))
+        relship[children[:12]] = 20                       # householders under 15
+        relship[np.flatnonzero(gqt == 3)[:8]] = 20        # householders in a nursing facility
+        relship[np.flatnonzero(adult)[:8]] = 37           # GQ persons in households
+        relship[np.flatnonzero(adult)[8:16]] = 99         # a code no rule mentions
+    persons = pl.DataFrame({
+        "nation": np.ones(n, dtype=np.int64), "state": state, "county": county, "tract": tract,
+        "block": block, "age": age, "sex": rng.integers(1, 3, n),
+        "race31": rng.choice([1, 1, 1, 2, 3], n), "hisp": rng.integers(1, 3, n),
+        "gqt": gqt, "relship": relship,
+    })
+    cells = persons.group_by(BLOCK_KEYS).agg(pl.len().cast(pl.Float64).alias("blend_pop"))
+    if fractional:  # estimates rather than counts, on the 1/64 grid so sums are exact
+        scale = pl.Series(rng.integers(8, 200, cells.height) / 64)
+        cells = cells.sort(BLOCK_KEYS).with_columns(pl.col("blend_pop") * scale)
+    return cells.sample(fraction=1.0, shuffle=True, seed=seed)
+
+
+def ref_relationship_ok(r) -> bool:
+    """The 2020 relationship rules, written out by hand for the reference."""
+    rel = r.get("relship")
+    if rel is None:
+        return True
+    if "gqt" in r:
+        if 20 <= rel <= 36 and r["gqt"] != 0:
+            return False
+        if rel == 37 and r["gqt"] not in (1, 2, 3, 4):
+            return False
+        if rel == 38 and r["gqt"] not in (5, 6, 7):
+            return False
+    if "age" in r and 20 <= rel <= 24 and (_missing(r["age"]) or r["age"] < 15):
+        return False
+    return True
+
+
+def ref_chain(rows, levels=BLOCK_LEVELS, detail_keys=BLOCK_KEYS, v="blend_pop"):
+    """The SAS program's steps, repeated once per level of a longer chain."""
+    detail = sorted(rows, key=lambda r: tuple(r[k] for k in detail_keys))
+    detail = [{**r, "householder": 1 if r.get("relship") == 20 else 0} for r in detail]
+
+    totals, source = {}, detail          # each level summed from the level below it
+    for keys in reversed(levels):
+        sums, _ = _summary(source, keys, v)
+        source = [{**dict(zip(keys, key, strict=True)), v: x} for key, x in sorted(sums.items())]
+        totals[keys] = source
+
+    control, controls = totals[levels[0]], {}
+    for above, keys in zip(levels, levels[1:], strict=False):
+        coarse = [{**r, v: ref_coarsen(r[v])} for r in totals[keys]]
+        raked = ref_rakeit(coarse, v, above, control, v, v)
+        rounded = ref_roundit(raked, v, above, v, extra_rule=ref_relationship_ok)
+        control = sorted(({k: r[k] for k in [*keys, v]} for r in rounded),
+                         key=lambda r: tuple(r[k] for k in keys))
+        controls[keys] = control
+
+    coarse = [{**r, v: ref_coarsen(r[v])} for r in detail]
+    raked = ref_rakeit(coarse, v, levels[-1], control, v, v)
+    rounded = ref_roundit(raked, v, levels[-1], v, extra_rule=ref_relationship_ok)
+    final = sorted(({k: r[k] for k in [*detail_keys, v]} for r in rounded),
+                   key=lambda r: tuple(r[k] for k in detail_keys))
+    return pl.DataFrame(final), {keys: pl.DataFrame(c) for keys, c in controls.items()}
+
+
+@pytest.fixture(scope="module")
+def blocks():
+    return make_block_detail(seed=1)
+
+
+@pytest.fixture(scope="module")
+def block_result(blocks):
+    return m.run_pipeline(blocks, block_config())
+
+
+@pytest.fixture(scope="module")
+def odd_blocks():
+    return make_block_detail(seed=1, impossible=True)
+
+
+@pytest.fixture(scope="module")
+def odd_result(odd_blocks):
+    return m.run_pipeline(odd_blocks, block_config())
+
+
+def test_level_names():
+    assert m.level_names(m.Config().levels) == ["state_gqt", "county_gqt"]
+    assert m.level_names(BLOCK_LEVELS) == BLOCK_NAMES
+
+
+def test_naming_the_two_sas_levels_changes_nothing(clean, clean_result):
+    cfg = m.Config(control_levels=(("nation", "state", "gqt"),
+                                   ("nation", "state", "county", "gqt")))
+    again = m.run_pipeline(clean, cfg)
+    assert_frame_equal(again.detail, clean_result.detail)
+    assert_frame_equal(again.county_gqt, clean_result.county_gqt)
+    assert again.householder_check is None and clean_result.householder_check is None
+
+
+@pytest.mark.parametrize("fractional", [False, True])
+def test_block_chain_matches_reference(fractional):
+    df = make_block_detail(seed=2, n_persons=5000, fractional=fractional, impossible=True)
+    result = m.run_pipeline(df, block_config())
+    ref_detail, ref_controls = ref_chain(df.to_dicts())
+    assert_frame_equal(result.detail, ref_detail, check_dtypes=False, check_exact=True)
+    for name, keys in zip(BLOCK_NAMES[1:], BLOCK_LEVELS[1:], strict=True):
+        got = result.controls[name].select(*keys, pl.col("control").alias("blend_pop"))
+        assert_frame_equal(got, ref_controls[keys], check_dtypes=False, check_exact=True)
+    # The comparison is only worth something if the awkward cases are present.
+    assert (~m.eligibility_expr_flag(df, block_config())).sum() >= 10
+    assert result.level_summary["positive_to_zero"].sum() > 0
+
+
+def test_block_output_has_the_same_cells_and_no_helper_column(blocks, block_result):
+    out = block_result.detail
+    assert out.columns == [*BLOCK_KEYS, "blend_pop"]
+    assert_frame_equal(out.select(BLOCK_KEYS), blocks.select(BLOCK_KEYS).sort(BLOCK_KEYS))
+    assert out["blend_pop"].dtype == pl.Int64 and (out["blend_pop"] >= 0).all()
+
+
+def test_every_level_of_the_chain_is_held_exactly(blocks, block_result):
+    flagged = block_result.detail.with_columns(
+        (pl.col("relship") == 20).cast(pl.Int8).alias("householder")
+    )
+    assert list(block_result.controls) == BLOCK_NAMES[1:]
+    for name, keys in zip(BLOCK_NAMES[1:], BLOCK_LEVELS[1:], strict=True):
+        table = block_result.controls[name]
+        direct = group_sum(flagged, list(keys))                  # summed straight from the output
+        assert_frame_equal(table.select(*keys, pl.col("control").alias("blend_pop")),
+                           direct, check_dtypes=False, check_exact=True)
+        assert (table["final"] == table["control"]).all()
+        assert (table["control"] == table["control"].round()).all()
+    # ... and the first level is the rounded original, as in the SAS program.
+    original = group_sum(blocks, list(BLOCK_LEVELS[0]))
+    final = group_sum(block_result.detail, list(BLOCK_LEVELS[0]))
+    assert final["blend_pop"].to_list() == original["blend_pop"].to_list()
+    assert block_result.level_summary["shortfall"].sum() == 0
+
+
+def test_each_level_nests_in_the_one_above(block_result):
+    for upper, lower, keys in zip(BLOCK_NAMES[1:], BLOCK_NAMES[2:], BLOCK_LEVELS[1:], strict=False):
+        parent = block_result.controls[upper].select(*keys, "control")
+        summed = group_sum(block_result.controls[lower], list(keys), "control")
+        assert_frame_equal(parent, summed, check_dtypes=False, check_exact=True)
+
+
+def test_householders_per_block_equal_their_control(block_result):
+    block_keys = list(BLOCK_LEVELS[3])
+    householders = group_sum(block_result.detail.filter(pl.col("relship") == 20), block_keys)
+    control = (block_result.controls["householder"].filter(pl.col("householder") == 1)
+               .select(*block_keys, pl.col("control").alias("blend_pop")))
+    joined = control.join(householders, on=block_keys, how="left", suffix="_out")
+    assert joined.height > 50
+    assert (joined["blend_pop"] == joined["blend_pop_out"].fill_null(0)).all()
+
+
+def test_householder_check_matches_a_direct_count(blocks, block_result):
+    def count(frame):
+        by_block = (frame.filter(pl.col("gqt") == 0).group_by(list(BLOCK_LEVELS[3]))
+                    .agg(pl.col("blend_pop").sum().alias("persons"),
+                         pl.col("blend_pop").filter(pl.col("relship") == 20).sum().alias("hh"))
+                    .filter(pl.col("persons") > 0))
+        return by_block.height, by_block.filter(pl.col("hh") == 0).height, by_block["hh"].sum()
+
+    check = block_result.householder_check
+    for when, frame in (("original", blocks), ("final", block_result.detail)):
+        places, without, householders = count(frame)
+        assert check["places_with_household_population"][when] == places
+        assert check["places_without_a_householder"][when] == without
+        assert check["householders"][when] == householders
+    assert "householder" in m.summarize(block_result)
+
+
+def test_level_summary_matches_direct_counts(blocks, block_result):
+    original = blocks.sort(BLOCK_KEYS)["blend_pop"]
+    final = block_result.detail["blend_pop"]
+    row = block_result.level_summary.filter(pl.col("level") == "detail").row(0, named=True)
+    assert row["rows"] == blocks.height
+    assert row["differ"] == (final != original).sum() > 0
+    assert row["max_abs_diff"] == (final - original).abs().max()
+    assert row["positive_to_zero"] == ((original > 0) & (final == 0)).sum() > 0
+    table = block_result.controls["block_gqt"]
+    row = block_result.level_summary.filter(pl.col("level") == "block_gqt").row(0, named=True)
+    assert row["rows"] == table.height and row["differ"] == (table["diff"] != 0).sum()
+    assert block_result.level_summary["level"].to_list() == [*BLOCK_NAMES[1:], "detail"]
+
+
+def test_level_summary_with_zero_cells(clean, clean_result):
+    # A zero that stays zero is not a positive cell that went to zero.
+    original = clean.sort(DETAIL_KEYS)["blend_pop"]
+    final = clean_result.detail["blend_pop"]
+    row = clean_result.level_summary.filter(pl.col("level") == "detail").row(0, named=True)
+    assert (original == 0).sum() > 0
+    assert row["positive_to_zero"] == ((original > 0) & (final == 0)).sum() > 0
+    assert clean_result.level_summary["level"].to_list() == ["county_gqt", "detail"]
+
+
+def test_block_pipeline_ignores_input_row_order(blocks, block_result):
+    again = m.run_pipeline(blocks.sample(fraction=1.0, shuffle=True, seed=5), block_config())
+    assert_frame_equal(again.detail, block_result.detail)
+
+
+def test_text_geography_codes_at_block_level(blocks, block_result):
+    as_text = blocks.with_columns(pl.col("state").cast(pl.String).str.zfill(2),
+                                  pl.col("county").cast(pl.String).str.zfill(3),
+                                  pl.col("tract").cast(pl.String).str.zfill(6),
+                                  pl.col("block").cast(pl.String))
+    out = m.run_pipeline(as_text, block_config()).detail
+    assert out["blend_pop"].to_list() == block_result.detail["blend_pop"].to_list()
+
+
+def test_nobody_is_added_outside_the_relationship_rules(odd_blocks, odd_result):
+    blocks, block_result, cfg = odd_blocks, odd_result, block_config()
+    flagged = blocks.sort(BLOCK_KEYS).with_columns(
+        (pl.col("relship") == 20).cast(pl.Int8).alias("householder")
+    )
+    last = list(BLOCK_LEVELS[-1])
+    control = block_result.controls["householder"].select(
+        *last, pl.col("control").alias("blend_pop")
+    )
+    raked = m.rakeit(flagged.with_columns(m.coarsen(pl.col("blend_pop"))), "blend_pop", last,
+                     control=control)
+    barred = block_result.detail.with_columns(raked["blend_pop"].alias("raked")).filter(
+        ~m.eligibility_expr(BLOCK_KEYS, cfg)
+    )
+    assert barred.height >= 10
+    assert (barred["blend_pop"] == barred["raked"].floor()).all()
+    # Without the rules some of those cells do receive an added person.
+    loose = m.run_pipeline(blocks, block_config(relationship_universe=()))
+    loose_barred = loose.detail.join(barred.select(BLOCK_KEYS), on=BLOCK_KEYS, how="semi")
+    assert loose_barred["blend_pop"].sum() > barred["blend_pop"].sum()
+
+
+def test_a_group_of_barred_cells_falls_short_and_is_reported(odd_result, caplog):
+    # With populated cells only, a control group whose cells are all barred
+    # has nowhere to put an added person.  The group ends short, as in SAS,
+    # and every table says so.
+    last = odd_result.controls["householder"]
+    missing = last["control"] - last["final"]
+    assert (missing >= 0).all() and missing.sum() > 0
+    summary = odd_result.level_summary.filter(pl.col("level") == "detail")
+    assert summary["shortfall"].item() == missing.sum()
+    assert odd_result.groups["detail"]["shortfall"].sum() == missing.sum()
+    assert -odd_result.state_gqt_check["final_minus_target"].sum() == missing.sum()
+
+
+def rule_frame(**columns) -> pl.DataFrame:
+    """Four cells with mantissas 0.9, 0.8, 0.2, 0.1 in one group; two persons to add."""
+    return pl.DataFrame({"g": 1, "x": [0.9, 0.8, 0.2, 0.1], **columns})
+
+
+def stuffed(df: pl.DataFrame, rules=None) -> list:
+    eligible = m.relationship_universe_expr(df.columns, "relship", rules)
+    return m.roundit(df, "x", ["g"], eligible=eligible)["x"].to_list()
+
+
+def test_relationship_rules_decide_who_can_receive_a_person():
+    # No relationship column: the rules are off.
+    assert stuffed(rule_frame()) == [1, 1, 0, 0]
+    # A householder aged 14 and a spouse of unknown age cannot receive anyone.
+    df = rule_frame(relship=[20, 21, 25, 20], age=[14, None, 3, 15], gqt=0)
+    assert stuffed(df) == [0, 0, 1, 1]
+    # A household relationship in a GQ, and a GQ person in a household.
+    df = rule_frame(relship=[25, 37, 37, 38], age=40, gqt=[3, 0, 3, 6])
+    assert stuffed(df) == [0, 0, 1, 1]
+    # Institutional and noninstitutional GQ persons belong to different GQ types.
+    df = rule_frame(relship=[37, 38, 38, 37], age=40, gqt=[5, 2, 7, 4])
+    assert stuffed(df) == [0, 0, 1, 1]
+    # A code no rule mentions is unrestricted; text codes are read as numbers.
+    df = rule_frame(relship=["99", "20", "36", "25"], age=[5, 5, 5, 5], gqt=0)
+    assert stuffed(df) == [1, 0, 1, 0]
+
+
+def test_relationship_rules_skip_tests_whose_column_is_absent():
+    # Without an age column only the GQ-type test applies, and the reverse.
+    assert stuffed(rule_frame(relship=[20, 37, 20, 25], gqt=[0, 0, 0, 0])) == [1, 0, 1, 0]
+    assert stuffed(rule_frame(relship=[20, 37, 20, 25], age=[10, 10, 30, 30])) == [0, 1, 1, 0]
+    # A missing GQ type cannot be called out of universe, as in the age rules.
+    df = pl.DataFrame({"g": 1, "x": [0.9, 0.8, 0.2, 0.1], "relship": [37, 37, 25, 25],
+                       "gqt": [None, 0, 0, 0]}, schema_overrides={"gqt": pl.Int64})
+    assert stuffed(df) == [1, 0, 1, 0]
+
+
+def test_custom_relationship_rules():
+    rules = (m.RelationshipRule(codes=(29, 31), min_age=30),
+             m.RelationshipRule(codes=(35,), max_age=20))
+    df = rule_frame(relship=[29, 35, 31, 35], age=[29, 21, 30, 20])
+    assert stuffed(df, rules) == [0, 0, 1, 1]
+    assert stuffed(df, ()) == [1, 1, 0, 0]
+
+
+def test_age_rules_and_relationship_rules_apply_together():
+    cfg = block_config()
+    df = pl.DataFrame({"relship": [38, 38, 20, 20], "gqt": [6, 6, 0, 0], "age": [70, 30, 12, 40]})
+    # military quarters at 70 fails the age rule; a householder at 12 the relationship rule
+    assert df.select(m.eligibility_expr(df.columns, cfg)).to_series().to_list() == [
+        False, True, False, True,
+    ]
+
+
+def test_householder_codes_are_configurable(blocks):
+    # Counting spouses as householders changes which totals the last level holds.
+    cfg = block_config(householder_codes=(20, 21))
+    result = m.run_pipeline(blocks, cfg)
+    got = group_sum(result.detail.filter(pl.col("relship").is_in([20, 21])), list(BLOCK_LEVELS[3]))
+    control = (result.controls["householder"].filter(pl.col("householder") == 1)
+               .select(*BLOCK_LEVELS[3], pl.col("control").alias("blend_pop")))
+    joined = control.join(got, on=list(BLOCK_LEVELS[3]), how="left", suffix="_out")
+    assert (joined["blend_pop"] == joined["blend_pop_out"].fill_null(0)).all()
+
+
+@pytest.mark.parametrize("problem,settings", [
+    ("at least two levels", {"control_levels": (("nation", "state", "gqt"),)}),
+    ("must contain every key", {"control_levels": (("nation", "state", "gqt"),
+                                                   ("nation", "county", "gqt"))}),
+    ("are not detail keys", {"control_levels": (("nation", "state", "gqt"),
+                                                ("nation", "state", "place", "gqt"))}),
+    ("set relationship_col", {"relationship_col": None}),
+    ("must be one of detail_keys", {"relationship_col": "relationship"}),
+    ("must add at least one key", {"control_levels": (("nation", "state", "gqt"),
+                                                      ("nation", "state", "gqt"))}),
+])
+def test_bad_control_chains_are_rejected(blocks, problem, settings):
+    with pytest.raises(ValueError, match=problem):
+        m.run_pipeline(blocks, block_config(**settings))
+
+
+BLOCK_TOML = """
+detail_keys = ["nation", "state", "county", "tract", "block",
+               "age", "sex", "race31", "hisp", "gqt", "relship"]
+control_levels = [
+    ["nation", "state", "gqt"],
+    ["nation", "state", "county", "gqt"],
+    ["nation", "state", "county", "tract", "gqt"],
+    ["nation", "state", "county", "tract", "block", "gqt"],
+    ["nation", "state", "county", "tract", "block", "gqt", "householder"],
+]
+relationship_col = "relship"
+householder_codes = [20]
+
+[[relationship_universe]]
+codes = [20, 21, 22, 23, 24]
+gqt = [0]
+min_age = 15
+
+[[relationship_universe]]
+codes = [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]
+gqt = [0]
+
+[[relationship_universe]]
+codes = [37]
+gqt = [1, 2, 3, 4]
+
+[[relationship_universe]]
+codes = [38]
+gqt = [5, 6, 7]
+"""
+
+
+def test_block_settings_load_from_toml(tmp_path):
+    path = tmp_path / "block.toml"
+    path.write_text(BLOCK_TOML)
+    assert m.Config.from_toml(path) == block_config(
+        relationship_universe=m.DEFAULT_RELATIONSHIP_UNIVERSE, householder_codes=(20,)
+    )
+    path.write_text(BLOCK_TOML + "\n[[relationship_universe]]\ncode = [40]\n")
+    with pytest.raises(ValueError, match="Bad relationship_universe entry"):
+        m.Config.from_toml(path)
+
+
+def test_block_command_line_round_trip(tmp_path, blocks, block_result):
+    src, cfg, out_dir = tmp_path / "blocks.parquet", tmp_path / "block.toml", tmp_path / "out"
+    m.write_table(blocks, src)
+    cfg.write_text(BLOCK_TOML)
+    assert m.main([str(src), "--out-dir", str(out_dir), "--config", str(cfg)]) == 0
+    assert_frame_equal(m.read_table(out_dir / "rounded_detail.parquet"), block_result.detail)
+    for name in BLOCK_NAMES[1:]:
+        table = m.read_table(out_dir / f"{name}_controls.parquet")
+        assert_frame_equal(table, block_result.controls[name])
+    summary = m.read_table(out_dir / "level_summary.csv")
+    assert summary["level"].to_list() == [*BLOCK_NAMES[1:], "detail"]
+    for name in ("state_gqt_check.csv", "difference_stats.csv", "shortfall_groups.csv"):
+        assert (out_dir / name).exists()
+    assert "with no householder" in (out_dir / "report.txt").read_text()
+
+
+def test_stats_without_a_gq_type_column():
+    table = m._difference_stats("some_level", np.array([1.0, -1.0, 0.0]), None)
+    assert table["universe"].unique().to_list() == ["all"] and table.height == 2

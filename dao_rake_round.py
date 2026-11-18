@@ -17,6 +17,19 @@ original file.
              integerize, with added persons kept inside each GQ type's age
              universe.
 
+Extension beyond the SAS program: Config.control_levels turns the two
+stages into a chain of any depth, for example
+
+    state x GQT -> county -> tract -> block -> block x householder -> detail
+
+Each level's totals are coarsened, raked to the integer controls of the level
+above and integerized, exactly as stage 1 does for counties.  With a
+relationship column configured, a derived 0/1 `householder` column can be
+used as a level (which controls householders per block), and relationship
+rules join the age rules in deciding which cells may receive an added
+person.  With the default Config none of this is active and the result is
+the SAS program's.
+
 Usage
 -----
     python dao_rake_round.py input.parquet --out-dir run1
@@ -95,6 +108,36 @@ AgeRules = Mapping[int, tuple[float | None, float | None]]
 
 
 @dataclass(frozen=True)
+class RelationshipRule:
+    """Where persons with one of `codes` can exist.
+
+    A row whose relationship is in `codes` may receive an added person only
+    if its GQ type is in `gqt` (when given) and its age is within
+    [min_age, max_age] (when given).  A missing age fails a `min_age` test,
+    as a missing age does in the SAS age rules.
+    """
+
+    codes: tuple[int, ...]
+    gqt: tuple[int, ...] | None = None
+    min_age: float | None = None
+    max_age: float | None = None
+
+
+# 2020 Census relationship codes (RELSHIP): 20 householder, 21-24 spouses and
+# unmarried partners, 25-36 other household members, 37 institutional GQ
+# person, 38 noninstitutional GQ person.  GQ types 1-4 are taken to be
+# institutional and 5-7 noninstitutional.
+# ASSUMPTION TO CONFIRM: the minimum age of 15 for householders, spouses and
+# partners.  Add further age rules (parents, in-laws, ...) in the config.
+DEFAULT_RELATIONSHIP_UNIVERSE: tuple[RelationshipRule, ...] = (
+    RelationshipRule(codes=(20, 21, 22, 23, 24), gqt=(0,), min_age=15),
+    RelationshipRule(codes=tuple(range(25, 37)), gqt=(0,)),
+    RelationshipRule(codes=(37,), gqt=(1, 2, 3, 4)),
+    RelationshipRule(codes=(38,), gqt=(5, 6, 7)),
+)
+
+
+@dataclass(frozen=True)
 class Config:
     """Everything the SAS program hard-codes, in one place."""
 
@@ -119,6 +162,34 @@ class Config:
     # False: raise if the value column has missing values.  True: follow SAS.
     allow_missing_values: bool = False
 
+    # ---- Extension beyond the SAS program ----------------------------------
+    # The chain of control levels, coarsest first; each entry is the key
+    # columns of one level and must contain the keys of the one before it.
+    # The first level is the unrounded control.  None means the SAS
+    # program's two levels: (state_gqt_keys, county_gqt_keys).
+    control_levels: tuple[tuple[str, ...], ...] | None = None
+
+    # Relationship to householder.  None means there is no such column.
+    relationship_col: str | None = None
+    # Relationship codes that mean "householder".
+    householder_codes: tuple[int, ...] = (20,)
+    # Name of a derived 0/1 column (1 = householder) that control_levels may
+    # use as a key.  It is not written to the output.
+    householder_col: str = "householder"
+    # Where each relationship can exist.  None means the 2020 Census defaults.
+    relationship_universe: tuple[RelationshipRule, ...] | None = None
+
+    @property
+    def levels(self) -> tuple[tuple[str, ...], ...]:
+        """The control chain in use."""
+        return self.control_levels or (self.state_gqt_keys, self.county_gqt_keys)
+
+    @property
+    def relationship_rules(self) -> tuple[RelationshipRule, ...]:
+        if self.relationship_universe is None:
+            return DEFAULT_RELATIONSHIP_UNIVERSE
+        return self.relationship_universe
+
     @classmethod
     def from_toml(cls, path: str | Path) -> Config:
         """Load a Config from a TOML file.  Unknown keys are an error."""
@@ -128,9 +199,11 @@ class Config:
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"Unknown config keys in {path}: {sorted(unknown)}")
-        for name in ("detail_keys", "state_gqt_keys", "county_gqt_keys"):
+        for name in ("detail_keys", "state_gqt_keys", "county_gqt_keys", "householder_codes"):
             if name in raw:
                 raw[name] = tuple(raw[name])
+        if "control_levels" in raw:
+            raw["control_levels"] = tuple(tuple(level) for level in raw["control_levels"])
         if "age_universe" in raw:
             # TOML keys are strings; each value is a table such as
             # { out_at_or_below = 15, out_at_or_above = 66 }.
@@ -138,7 +211,43 @@ class Config:
                 int(gqt): (rule.get("out_at_or_below"), rule.get("out_at_or_above"))
                 for gqt, rule in raw["age_universe"].items()
             }
+        if "relationship_universe" in raw:
+            # An array of tables such as { codes = [20, 21], gqt = [0], min_age = 15 }.
+            rules = []
+            for rule in raw["relationship_universe"]:
+                extra = set(rule) - {"codes", "gqt", "min_age", "max_age"}
+                if extra or "codes" not in rule:
+                    raise ValueError(f"Bad relationship_universe entry in {path}: {rule}")
+                rules.append(RelationshipRule(
+                    codes=tuple(rule["codes"]),
+                    gqt=tuple(rule["gqt"]) if "gqt" in rule else None,
+                    min_age=rule.get("min_age"),
+                    max_age=rule.get("max_age"),
+                ))
+            raw["relationship_universe"] = tuple(rules)
         return cls(**raw)
+
+
+def level_names(levels: Sequence[Sequence[str]]) -> list[str]:
+    """A short name per control level, from the keys it adds.
+
+    The first level is named by its keys after the first one, every other
+    level by the keys after the prefix it shares with the level above:
+    (nation, state, gqt), (nation, state, county, gqt) -> state_gqt, county_gqt.
+    """
+    names = []
+    for i, keys in enumerate(levels):
+        if i == 0:
+            new = list(keys[1:]) or list(keys)
+        else:
+            shared = 0
+            for a, b in zip(levels[i - 1], keys, strict=False):
+                if a != b:
+                    break
+                shared += 1
+            new = list(keys[shared:])
+        names.append("_".join(new))
+    return names
 
 
 # --------------------------------------------------------------------------
@@ -226,11 +335,13 @@ def sort_by_keys(df: pl.DataFrame, keys: Sequence[str]) -> pl.DataFrame:
     times faster on a large frame.  Polars sorts one integer column much
     faster than several columns, so the keys are packed into one integer
     whose order is the order of the key combination: each key becomes a
-    digit (its offset from the column minimum for integers, its rank among
-    the distinct values otherwise) of a mixed-radix number.
+    digit of a mixed-radix number.  The digit is the key's offset from the
+    column minimum for integers with a compact range, and its rank among the
+    distinct values otherwise (text, floats, sparse codes such as tracts).
 
-    Falls back to the plain sort if a key has nulls or the packed number
-    would not fit in 64 bits.
+    Keys that do not fit together in 64 bits are packed into two or more
+    integers, which are then sorted together.  Falls back to the plain sort
+    only if a key has nulls.
     """
     keys = list(keys)
     if not keys or df.height < 2:
@@ -238,25 +349,33 @@ def sort_by_keys(df: pl.DataFrame, keys: Sequence[str]) -> pl.DataFrame:
     if df.select(pl.any_horizontal(pl.col(keys).is_null()).any()).item():
         return df.sort(keys, maintain_order=True)
 
-    work, digits, span = df, [], 1
+    work, digits = df, []
     for k in keys:
+        low = high = None
         if df.schema[k] in _PACKABLE_INTEGERS:
             low, high = df[k].min(), df[k].max()
+        if low is not None and high - low < df.height:
             digit, size = pl.col(k).cast(pl.Int64) - low, high - low + 1
         else:
             levels = df.select(k).unique().sort(k).with_row_index(f"__digit_{k}")
             work = work.join(levels, on=k, how="left", maintain_order="left")
             digit, size = pl.col(f"__digit_{k}"), levels.height
-        digits.append((digit, size))
-        span *= size
-    if span >= 2**63:
-        return df.sort(keys, maintain_order=True)
+        digits.append((digit.cast(pl.UInt64), size))  # every size is <= df.height
 
-    packed = pl.lit(0, dtype=pl.UInt64)
+    # Pack the digits, in key order, into as few 63-bit integers as possible.
+    packed, current, span = [], None, 1
     for digit, size in digits:
-        packed = packed * size + digit.cast(pl.UInt64)
-    order = work.select(packed.alias("__packed")).with_row_index("__row")
-    order = order.sort("__packed", maintain_order=True)
+        if current is not None and span * size < 2**63:
+            current, span = current * size + digit, span * size
+        else:
+            if current is not None:
+                packed.append(current)
+            current, span = digit, size
+    packed.append(current)
+
+    names = [f"__packed_{i}" for i in range(len(packed))]
+    order = work.select(p.alias(n) for p, n in zip(packed, names, strict=True))
+    order = order.with_row_index("__row").sort(names, maintain_order=True)
     return df[order["__row"]]
 
 
@@ -388,6 +507,53 @@ def age_universe_expr(
     return ~out_of_universe.fill_null(False)
 
 
+def relationship_universe_expr(
+    columns: Collection[str],
+    relationship_col: str | None,
+    rules: Sequence[RelationshipRule] | None = None,
+    age_col: str = "age",
+    gqt_col: str = "gqt",
+) -> pl.Expr:
+    """Boolean expression: true where the relationship rules allow an added person.
+
+    Not part of the SAS macro.  Every row is eligible when the frame has no
+    relationship column.  A rule's GQ-type test is skipped when the frame has
+    no GQ-type column, and its age tests when it has no age column.  A
+    relationship code that no rule mentions is unrestricted.
+    """
+    if relationship_col is None or relationship_col not in columns:
+        return pl.lit(True)
+    rules = DEFAULT_RELATIONSHIP_UNIVERSE if rules is None else rules
+    relationship = pl.col(relationship_col).cast(pl.Float64)
+    out_of_universe = pl.lit(False)
+    for rule in rules:
+        in_rule = relationship.is_in([float(code) for code in rule.codes])
+        if rule.gqt is not None and gqt_col in columns:
+            gqt = pl.col(gqt_col).cast(pl.Float64)
+            out_of_universe |= in_rule & ~gqt.is_in([float(code) for code in rule.gqt])
+        if age_col in columns:
+            age = _value(age_col)
+            if rule.min_age is not None:  # a missing age is below every minimum
+                out_of_universe |= in_rule & (age.is_null() | (age < rule.min_age))
+            if rule.max_age is not None:
+                out_of_universe |= in_rule & (age > rule.max_age)
+    return ~out_of_universe.fill_null(False)
+
+
+def eligibility_expr(columns: Collection[str], cfg: Config) -> pl.Expr:
+    """The age rules and the relationship rules together, for a frame's columns."""
+    return age_universe_expr(columns, cfg.age_col, cfg.gqt_col, cfg.age_universe) & (
+        relationship_universe_expr(
+            columns, cfg.relationship_col, cfg.relationship_rules, cfg.age_col, cfg.gqt_col
+        )
+    )
+
+
+def eligibility_expr_flag(df: pl.DataFrame, cfg: Config) -> pl.Series:
+    """eligibility_expr() evaluated on `df`, as a Boolean Series."""
+    return df.select(eligibility_expr(df.columns, cfg).alias("eligible")).to_series()
+
+
 def age_universe_flag(
     df: pl.DataFrame,
     age_col: str = "age",
@@ -409,6 +575,7 @@ def roundit(
     age_col: str = "age",
     gqt_col: str = "gqt",
     age_universe: AgeRules | None = None,
+    eligible: pl.Expr | None = None,
     tiebreaker_col: str | None = None,
     return_groups: bool = False,
 ) -> pl.DataFrame | tuple[pl.DataFrame, pl.DataFrame]:
@@ -423,7 +590,8 @@ def roundit(
       4. the first `stuffpool` ELIGIBLE rows in that order get integer + 1;
          every other row gets integer
 
-    Eligibility comes from age_universe_expr(); ineligible rows are skipped
+    Eligibility comes from age_universe_expr(), or from `eligible` (a Boolean
+    expression on `df`) when that is given.  Ineligible rows are skipped
     without using up the pool.  If a group has fewer eligible rows than its
     pool, it ends short of its total (a warning is logged; SAS is silent).
 
@@ -447,8 +615,9 @@ def roundit(
 
     # A narrow working frame, so the sorts below do not carry the caller's
     # other columns along.
-    cols = [_value(value_col).alias(_X),
-            age_universe_expr(df.columns, age_col, gqt_col, age_universe).alias(_ELIG)]
+    if eligible is None:
+        eligible = age_universe_expr(df.columns, age_col, gqt_col, age_universe)
+    cols = [_value(value_col).alias(_X), eligible.alias(_ELIG)]
     if tiebreaker_col is not None:
         cols.append(pl.col(tiebreaker_col).cast(pl.Float64).alias(_TIE))
     work = (
@@ -541,36 +710,82 @@ class PipelineResult:
     """Outputs of run_pipeline()."""
 
     detail: pl.DataFrame            # final file (SAS: base_round6_cr)
-    county_gqt: pl.DataFrame        # stage 1: original, coarsened, raked, control
-    state_gqt_check: pl.DataFrame   # do the outputs hit the state x GQT controls?
-    stage1_groups: pl.DataFrame     # roundit diagnostics, one row per state x GQT
-    stage2_groups: pl.DataFrame     # roundit diagnostics, one row per county x GQT
+    level_names: list[str]          # one name per control level, coarsest first
+    controls: dict[str, pl.DataFrame]  # per level below the first: original,
+    #                                    coarsened, raked, control, final, diff
+    state_gqt_check: pl.DataFrame   # do the outputs hit the first level's totals?
+    groups: dict[str, pl.DataFrame]  # roundit diagnostics per stage; last is "detail"
+    level_summary: pl.DataFrame     # one line per level and one for the detail
     stats: pl.DataFrame             # PROC MEANS equivalents on the differences
-    compare: dict                   # PROC COMPARE equivalent, county x GQT level
+    compare: dict                   # PROC COMPARE equivalent, second level
+    householder_check: dict | None = None  # only with a householder level
+
+    # The SAS program's two stages, by their old names.
+    @property
+    def county_gqt(self) -> pl.DataFrame:
+        return self.controls[self.level_names[1]]
+
+    @property
+    def stage1_groups(self) -> pl.DataFrame:
+        return self.groups[self.level_names[1]]
+
+    @property
+    def stage2_groups(self) -> pl.DataFrame:
+        return self.groups["detail"]
+
+
+def _check_config(cfg: Config, levels: list[list[str]], names: list[str]) -> None:
+    """Fail early, with a clear message, on a control chain that cannot work."""
+    if len(levels) < 2:
+        raise ValueError("control_levels needs at least two levels")
+    allowed = set(cfg.detail_keys) | {cfg.householder_col}
+    for i, keys in enumerate(levels):
+        unknown = [k for k in keys if k not in allowed]
+        if unknown:
+            raise ValueError(f"control level {names[i]}: {unknown} are not detail keys")
+        if i and not set(levels[i - 1]) <= set(keys):
+            raise ValueError(
+                f"control level {names[i]} must contain every key of the level above it "
+                f"({names[i - 1]}): {levels[i - 1]}"
+            )
+        if i and len(set(keys)) == len(set(levels[i - 1])):
+            raise ValueError(f"control level {i + 1} must add at least one key to the level above")
+    if len(set(names)) != len(names) or "detail" in names:
+        raise ValueError(f"control_levels give ambiguous level names: {names}")
+    uses_flag = any(cfg.householder_col in keys for keys in levels)
+    if uses_flag and cfg.householder_col not in cfg.detail_keys and cfg.relationship_col is None:
+        raise ValueError(
+            f"control_levels use {cfg.householder_col!r}; set relationship_col so it can be derived"
+        )
+    if cfg.relationship_col is not None and cfg.relationship_col not in cfg.detail_keys:
+        raise ValueError(f"relationship_col {cfg.relationship_col!r} must be one of detail_keys")
 
 
 def run_pipeline(df: pl.DataFrame, cfg: Config | None = None) -> PipelineResult:
-    """Run both stages and the review checks on a detail file."""
+    """Run every stage of the control chain and the review checks on a detail file."""
     cfg = cfg or Config()
     v = cfg.value_col
     detail_keys = list(cfg.detail_keys)
-    state_keys = list(cfg.state_gqt_keys)
-    county_keys = list(cfg.county_gqt_keys)
+    levels = [list(keys) for keys in cfg.levels]
+    names = level_names(levels)
 
     if not isinstance(df, pl.DataFrame):
         raise TypeError(
             f"input: expected a polars.DataFrame, got {type(df).__name__}. "
             "polars.from_pandas(df) converts a pandas frame."
         )
+    _check_config(cfg, levels, names)
     _require_columns(df, [*detail_keys, v], "input")
     _require_complete_keys(df, detail_keys, "input")
     if not df.schema[v].is_numeric():
         raise TypeError(f"input: column {v!r} must be numeric")
     coarsened = coarsen(pl.col(v), cfg.rounding_base, cfg.min_positive)
-    roundit_opts = {
-        "seed": cfg.seed, "age_col": cfg.age_col, "gqt_col": cfg.gqt_col,
-        "age_universe": cfg.age_universe, "return_groups": True,
-    }
+
+    def integerize(frame: pl.DataFrame, group: list[str]) -> tuple[pl.DataFrame, pl.DataFrame]:
+        # The rules only bite where the frame has the columns they test, so
+        # they are off for the totals tables, as in the SAS macro.
+        return roundit(frame, v, group, seed=cfg.seed, return_groups=True,
+                       eligible=eligibility_expr(frame.columns, cfg))
 
     # ---- Preparation -------------------------------------------------------
     # proc sort data=rounded_input; by nation state county age sex race31 hisp gqt;
@@ -583,83 +798,166 @@ def run_pipeline(df: pl.DataFrame, cfg: Config | None = None) -> PipelineResult:
         )
     log.info("input: %d rows, total %s = %.4f", detail.height, v, detail[v].sum())
 
-    # rounded_input_gqt: unrounded county x GQT totals
-    county = detail.group_by(county_keys).agg(pl.col(v).sum()).sort(county_keys)
-    # rounded_input_stategqt: unrounded state x GQT totals (summed from the county totals)
-    state = county.group_by(state_keys).agg(pl.col(v).sum()).sort(state_keys)
+    flag = cfg.householder_col
+    if flag not in detail_keys and any(flag in keys for keys in levels):
+        codes = [float(code) for code in cfg.householder_codes]
+        is_householder = pl.col(cfg.relationship_col).cast(pl.Float64).is_in(codes)
+        detail = detail.with_columns(is_householder.cast(pl.Int8).alias(flag))
 
-    # ---- Stage 1: county x GQT controls -------------------------------------
-    county_r = county.with_columns(coarsened)
-    county_rc = rakeit(county_r, v, state_keys, control=state)
-    # No age column here, so the age-universe rules are off.
-    county_rcr, stage1_groups = roundit(county_rc, v, state_keys, **roundit_opts)
-    log.info("stage 1: %d county x GQT controls", county_rcr.height)
+    # Unrounded totals at every level, each summed from the level below it
+    # (SAS: rounded_input_gqt from the detail, rounded_input_stategqt from that).
+    totals: list[pl.DataFrame] = [detail] * len(levels)
+    source = detail
+    for i in reversed(range(len(levels))):
+        source = sort_by_keys(source.group_by(levels[i]).agg(pl.col(v).sum()), levels[i])
+        totals[i] = source
 
-    # ---- Stage 2: detail cells ----------------------------------------------
+    # ---- One stage per level below the first --------------------------------
+    # Coarsen the level's totals, rake them to the controls of the level
+    # above (within that level's groups), integerize.  The first level's
+    # controls are its unrounded totals.  SAS stage 1 is this for counties.
+    control = totals[0]
+    steps: dict[str, dict[str, pl.DataFrame]] = {}
+    groups: dict[str, pl.DataFrame] = {}
+    for i in range(1, len(levels)):
+        above = levels[i - 1]
+        level_r = totals[i].with_columns(coarsened)
+        level_rc = rakeit(level_r, v, above, control=control)
+        level_rcr, groups[names[i]] = integerize(level_rc, above)
+        steps[names[i]] = {"coarsened": level_r, "raked": level_rc, "control": level_rcr}
+        control = level_rcr
+        log.info("level %s: %d controls", names[i], level_rcr.height)
+
+    # ---- Last stage: detail cells (SAS stage 2) -----------------------------
     detail_r = detail.with_columns(coarsened)
-    detail_c = rakeit(detail_r, v, county_keys, control=county_rcr)
-    detail_cr, stage2_groups = roundit(detail_c, v, county_keys, **roundit_opts)
-    # Keep the nine columns.  Rows are still sorted by the eight keys.  The
-    # values are whole numbers, so store them as integers (null if missing).
-    final = detail_cr.select(*detail_keys, pl.col(v).cast(pl.Int64))
-    log.info("stage 2: %d detail rows, total %s = %d", final.height, v, final[v].sum())
+    detail_c = rakeit(detail_r, v, levels[-1], control=control)
+    detail_cr, groups["detail"] = integerize(detail_c, levels[-1])
+    # The values are whole numbers, so store them as integers (null if
+    # missing).  Rows are still sorted by the detail keys.
+    detail_cr = detail_cr.with_columns(pl.col(v).cast(pl.Int64))
+    final = detail_cr.select(*detail_keys, v)
+    log.info("detail: %d rows, total %s = %d", final.height, v, final[v].sum())
 
     # ---- Review checks ------------------------------------------------------
-    county_out = county.select(*county_keys, pl.col(v).alias("original"))
-    steps = {
-        "coarsened": county_r,
-        "raked": county_rc,
-        "control": county_rcr,
-        "final": final.group_by(county_keys).agg(pl.col(v).sum()),
-    }
-    for name, frame in steps.items():
-        county_out = county_out.join(
-            frame.select(*county_keys, pl.col(v).alias(name)),
-            on=county_keys, how="left", maintain_order="left",
-        )
-    county_out = county_out.with_columns(
-        (pl.col("final") - pl.col("original")).alias("diff")
-    ).with_columns(pl.col("diff").abs().alias("absdiff"))
+    # The final file summed to every level, each from the level below it.
+    final_sums: list[pl.DataFrame] = [detail_cr] * len(levels)
+    source = detail_cr
+    for i in reversed(range(len(levels))):
+        source = source.group_by(levels[i]).agg(pl.col(v).sum())
+        final_sums[i] = source
 
-    state_check = (
-        state.select(*state_keys, pl.col(v).alias("original"))
+    controls: dict[str, pl.DataFrame] = {}
+    for i in range(1, len(levels)):
+        table = totals[i].select(*levels[i], pl.col(v).alias("original"))
+        for column, frame in {**steps[names[i]], "final": final_sums[i]}.items():
+            table = table.join(
+                frame.select(*levels[i], pl.col(v).alias(column)),
+                on=levels[i], how="left", maintain_order="left",
+            )
+        controls[names[i]] = table.with_columns(
+            (pl.col("final") - pl.col("original")).alias("diff")
+        ).with_columns(pl.col("diff").abs().alias("absdiff"))
+
+    first = controls[names[1]]
+    top_check = (
+        totals[0].select(*levels[0], pl.col(v).alias("original"))
         .with_columns(sas_round(pl.col("original")).alias("target"))
         .join(
-            county_out.group_by(state_keys).agg(
+            first.group_by(levels[0]).agg(
                 pl.col("raked").sum().alias("raked_county_sum"),
                 pl.col("control").sum().alias("control_sum"),
-                pl.col("final").sum().alias("final_sum"),
             ),
-            on=state_keys, how="left", maintain_order="left",
+            on=levels[0], how="left", maintain_order="left",
+        )
+        .join(
+            final_sums[0].select(*levels[0], pl.col(v).alias("final_sum")),
+            on=levels[0], how="left", maintain_order="left",
         )
         .with_columns((pl.col("final_sum") - pl.col("target")).alias("final_minus_target"))
     )
 
     # `final` and `detail` hold the same cells in the same order.
-    detail_diff = (final[v] - detail[v]).to_numpy()
-    stats = pl.concat([
-        _difference_stats("county_gqt", county_out["diff"].to_numpy(),
-                          county_out[cfg.gqt_col].cast(pl.Float64).to_numpy()),
-        _difference_stats("detail", detail_diff,
-                          final[cfg.gqt_col].cast(pl.Float64).to_numpy()),
+    detail_table = final.select(
+        *([cfg.gqt_col] if cfg.gqt_col in detail_keys else []),
+        detail[v].alias("original"), pl.col(v).alias("final"),
+    ).with_columns((pl.col("final") - pl.col("original")).alias("diff"))
+    tables = {**controls, "detail": detail_table}
+    stats = pl.concat(
+        _difference_stats(name, table["diff"].to_numpy(), _gqt_values(table, cfg.gqt_col))
+        for name, table in tables.items()
+    )
+    level_summary = pl.DataFrame([
+        {
+            "level": name,
+            "rows": table.height,
+            "differ": int((table["diff"] != 0).sum()),
+            "max_abs_diff": float(table["diff"].abs().max() or 0.0),
+            "positive_to_zero": int(((table["original"] > 0) & (table["final"] == 0)).sum()),
+            "shortfall": int(groups[name]["shortfall"].sum()),
+        }
+        for name, table in tables.items()
     ])
 
     compare = {
-        "level": "county_gqt",
-        "rows_compared": county_out.height,
-        "rows_unequal": int((county_out["diff"] != 0).sum()),
-        "max_abs_diff": float(county_out["absdiff"].max() or 0.0),
+        "level": names[1],
+        "rows_compared": first.height,
+        "rows_unequal": int((first["diff"] != 0).sum()),
+        "max_abs_diff": float(first["absdiff"].max() or 0.0),
     }
 
     return PipelineResult(
         detail=final,
-        county_gqt=county_out,
-        state_gqt_check=state_check,
-        stage1_groups=stage1_groups,
-        stage2_groups=stage2_groups,
+        level_names=names,
+        controls=controls,
+        state_gqt_check=top_check,
+        groups=groups,
+        level_summary=level_summary,
         stats=stats,
         compare=compare,
+        householder_check=_householder_check(detail, detail_cr, cfg, levels),
     )
+
+
+def _gqt_values(table: pl.DataFrame, gqt_col: str) -> np.ndarray | None:
+    if gqt_col not in table.columns:
+        return None
+    return table[gqt_col].cast(pl.Float64).to_numpy()
+
+
+def _householder_check(
+    before: pl.DataFrame, after: pl.DataFrame, cfg: Config, levels: list[list[str]]
+) -> dict | None:
+    """Count places left with a household population but no householder.
+
+    A "place" is a group of the level just above the householder level
+    (a block, in the block-level chain), counted over household population
+    only (GQ type 0).  The method can produce such places: it controls how
+    many householders a block has, not which households they head.
+    """
+    flag, v = cfg.householder_col, cfg.value_col
+    with_flag = [keys for keys in levels if flag in keys]
+    if not with_flag:
+        return None
+    place = [k for k in with_flag[0] if k != flag]
+
+    def count(frame: pl.DataFrame) -> tuple[int, int, int]:
+        if cfg.gqt_col in frame.columns:
+            frame = frame.filter(pl.col(cfg.gqt_col).cast(pl.Float64) == 0)
+        by_place = frame.group_by(place).agg(
+            pl.col(v).sum().alias("persons"),
+            (pl.col(v) * pl.col(flag)).sum().alias("householders"),
+        ).filter(pl.col("persons") > 0)
+        without = by_place.filter(pl.col("householders") == 0).height
+        return by_place.height, without, int(round(by_place["householders"].sum()))
+
+    places_0, without_0, householders_0 = count(before)
+    places_1, without_1, householders_1 = count(after)
+    return {
+        "place_keys": place,
+        "places_with_household_population": {"original": places_0, "final": places_1},
+        "places_without_a_householder": {"original": without_0, "final": without_1},
+        "householders": {"original": householders_0, "final": householders_1},
+    }
 
 
 _STAT_NAMES = ["sum", "n", "mean", "std", "min", "max", "mode", "median", "p5", "p95"]
@@ -696,13 +994,14 @@ def _describe(x: np.ndarray) -> dict:
     return {k: (val if k == "n" else float(val)) for k, val in stats.items()}
 
 
-def _difference_stats(level: str, diff: np.ndarray, gqt: np.ndarray) -> pl.DataFrame:
-    """Stats on diff and |diff| for all rows, households (gqt = 0) and GQ (gqt ne 0)."""
-    universes = {
-        "all": np.ones(len(diff), dtype=bool),
-        "household": gqt == 0,
-        "group_quarters": gqt != 0,
-    }
+def _difference_stats(level: str, diff: np.ndarray, gqt: np.ndarray | None) -> pl.DataFrame:
+    """Stats on diff and |diff| for all rows, households (gqt = 0) and GQ (gqt ne 0).
+
+    Without a GQ-type column only the "all" lines are produced.
+    """
+    universes = {"all": np.ones(len(diff), dtype=bool)}
+    if gqt is not None:
+        universes |= {"household": gqt == 0, "group_quarters": gqt != 0}
     rows = []
     for universe, mask in universes.items():
         for variable, values in (("diff", diff[mask]), ("absdiff", np.abs(diff[mask]))):
@@ -749,44 +1048,61 @@ def write_table(df: pl.DataFrame, path: Path) -> None:
 
 
 def write_outputs(result: PipelineResult, out_dir: Path, fmt: str = "parquet") -> None:
-    """Write the rounded file, the stage 1 controls and the review tables."""
+    """Write the rounded file, each level's controls and the review tables."""
     out_dir.mkdir(parents=True, exist_ok=True)
     write_table(result.detail, out_dir / f"rounded_detail.{fmt}")
-    write_table(result.county_gqt, out_dir / f"county_gqt_controls.{fmt}")
-    result.state_gqt_check.write_csv(out_dir / "state_gqt_check.csv")
+    for name, table in result.controls.items():
+        write_table(table, out_dir / f"{name}_controls.{fmt}")
+    result.state_gqt_check.write_csv(out_dir / f"{result.level_names[0]}_check.csv")
+    result.level_summary.write_csv(out_dir / "level_summary.csv")
     result.stats.write_csv(out_dir / "difference_stats.csv")
-    # The two stages have different group keys, hence the diagonal concat.
+    # The stages have different group keys, hence the diagonal concat.
     short = pl.concat(
         [
-            result.stage1_groups.with_columns(pl.lit(1).alias("stage")),
-            result.stage2_groups.with_columns(pl.lit(2).alias("stage")),
+            table.with_columns(pl.lit(i).alias("stage"), pl.lit(name).alias("level"))
+            for i, (name, table) in enumerate(result.groups.items(), start=1)
         ],
         how="diagonal",
     )
     short.filter(pl.col("shortfall") > 0).write_csv(out_dir / "shortfall_groups.csv")
 
 
-def summarize(result: PipelineResult) -> str:
-    """Short text summary of the review checks."""
-    sc = result.state_gqt_check
-    off = int((sc["final_minus_target"] != 0).sum())
+def _as_text(table: pl.DataFrame) -> str:
     with pl.Config(
         tbl_rows=-1, tbl_cols=-1, tbl_width_chars=200, float_precision=4,
         tbl_hide_dataframe_shape=True, tbl_hide_column_data_types=True,
         tbl_formatting="ASCII_MARKDOWN",
     ):
-        stats_table = str(result.stats)
+        return str(table)
+
+
+def summarize(result: PipelineResult) -> str:
+    """Short text summary of the review checks."""
+    top = result.state_gqt_check
+    off = int((top["final_minus_target"] != 0).sum())
     lines = [
-        f"Detail rows: {result.detail.height:,}",
-        f"County x GQT groups: {result.county_gqt.height:,} "
-        f"({result.compare['rows_unequal']:,} differ from the original; "
-        f"max abs diff {result.compare['max_abs_diff']:.4f})",
-        f"State x GQT groups: {sc.height:,} ({off} do not match their rounded original total)",
-        f"Stage 1 shortfall: {int(result.stage1_groups['shortfall'].sum())} person(s)",
-        f"Stage 2 shortfall: {int(result.stage2_groups['shortfall'].sum())} person(s)",
+        f"Control chain: {' -> '.join(result.level_names)} -> detail",
+        f"{result.level_names[0]} groups: {top.height:,} "
+        f"({off} do not match their rounded original total)",
         "",
-        stats_table,
+        "Per level: rows, how many differ from the original, largest difference,",
+        "positive originals that ended at zero, persons that could not be placed.",
+        _as_text(result.level_summary),
     ]
+    check = result.householder_check
+    if check:
+        places = check["places_with_household_population"]
+        without = check["places_without_a_householder"]
+        lines += [
+            "",
+            f"Householders: {check['householders']['original']:,} originally, "
+            f"{check['householders']['final']:,} in the output.",
+            f"Places ({', '.join(check['place_keys'])}) with a household population: "
+            f"{places['original']:,} originally, {places['final']:,} in the output.",
+            f"Of those, with no householder: {without['original']:,} originally, "
+            f"{without['final']:,} in the output.",
+        ]
+    lines += ["", _as_text(result.stats)]
     return "\n".join(lines)
 
 
@@ -798,7 +1114,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out-dir", type=Path, required=True, help="folder for outputs")
     p.add_argument("--config", type=Path, help="TOML file overriding Config defaults")
     p.add_argument("--format", choices=["parquet", "csv"], default="parquet",
-                   help="format of the two large outputs (default: parquet)")
+                   help="format of the large outputs (default: parquet)")
     p.add_argument("--base", type=float, help="rounding base (overrides config; SAS uses 5)")
     p.add_argument("--seed", type=int, help="tiebreaker seed (overrides config; SAS uses 42)")
     return p.parse_args(argv)
